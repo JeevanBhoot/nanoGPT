@@ -10,7 +10,7 @@ import torch
 import tiktoken
 
 from model import GPTConfig, GPT
-from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT
+from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT, load_dense_into_tp
 
 
 _DEFAULT_DTYPE = (
@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=1,
+        default=10,
         help="Number of completions to generate.",
     )
     parser.add_argument(
@@ -52,13 +52,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.8,
         help="Softmax temperature for sampling.",
     )
     parser.add_argument(
         "--top_k",
         type=int,
-        default=1,
+        default=100,
         help="Keep only the top-k tokens during sampling.",
     )
     parser.add_argument(
@@ -113,19 +113,22 @@ def main() -> None:
     if args.init_from == "resume":
         ckpt_path = os.path.join(args.out_dir, "ckpt.pt")
         checkpoint = torch.load(ckpt_path, map_location=args.device)
-        if args.tp > 1:
-            gptconf = TensorParallelGPTConfig(**checkpoint["model_args"])
-            gptconf.tp_world_size = args.tp
-            model = TensorParallelGPT(gptconf)
-        else:
-            gptconf = GPTConfig(**checkpoint["model_args"])
-            model = GPT(gptconf)
         state_dict = checkpoint["model"]
-        unwanted_prefix = "_orig_mod."
+
+        unwanted_prefix = "_orig_mod." # torch.compile adds this prefix
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
+
+        if args.tp > 1:
+            gptconf = TensorParallelGPTConfig(**checkpoint["model_args"])
+            gptconf.world_size = args.tp
+            model = TensorParallelGPT(gptconf)
+            load_dense_into_tp(model, state_dict)
+        else:
+            gptconf = GPTConfig(**checkpoint["model_args"])
+            model = GPT(gptconf)
+            model.load_state_dict(state_dict)
     elif args.init_from.startswith("gpt2"):
         model = GPT.from_pretrained(args.init_from, dict(dropout=0.0))
         checkpoint = None
