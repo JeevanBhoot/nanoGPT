@@ -142,7 +142,7 @@ class TensorParallelCausalSelfAttention(nn.Module):
         - Output projection is row-parallel
         - Single all-reduce sum after attention to obtain final values
     """
-    def __init__(self, config: TensorParallelGPTConfig, tp: TensorParallel):
+    def __init__(self, config: TensorParallelSPDGPTConfig, tp: TensorParallel):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         assert config.n_head % tp.world_size == 0, "Number of heads must be divisible by TP world size"
@@ -172,6 +172,9 @@ class TensorParallelCausalSelfAttention(nn.Module):
             bias=cproj_bias,
             tp=tp,
         )
+        if self.drop_attn_sync:
+            for p in self.c_proj.parameters():
+                p.requires_grad = False
         # regularization
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
@@ -209,6 +212,8 @@ class TensorParallelCausalSelfAttention(nn.Module):
                 y = att @ v
             
             y = y.transpose(1, 2).contiguous().view(B, T, self.local_n_head * self.head_dim)
+            if self.drop_attn_sync:
+                y = self.resid_dropout(y)
             attn_outputs.append(y)
 
         if self.drop_attn_sync:
@@ -221,7 +226,7 @@ class TensorParallelCausalSelfAttention(nn.Module):
 
 
 class TensorParallelMLP(nn.Module):
-    def __init__(self, config: TensorParallelGPTConfig, tp: TensorParallel):
+    def __init__(self, config: TensorParallelSPDGPTConfig, tp: TensorParallel):
         super().__init__()
         self.c_fc    = ColumnParallelLinear(config.n_embd, 4 * config.n_embd, bias=config.bias, tp=tp)
         self.gelu    = nn.GELU()
@@ -249,24 +254,35 @@ class TensorParallelMLP(nn.Module):
 
 
 class TensorParallelBlock(nn.Module):
-    def __init__(self, config: TensorParallelGPTConfig, tp: TensorParallel):
+    def __init__(self, config: TensorParallelSPDGPTConfig, tp: TensorParallel):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = TensorParallelCausalSelfAttention(config, tp)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = TensorParallelMLP(config, tp)
         self.drop_attn_sync = getattr(config, "drop_attn_sync", False)
+        self.world_size = tp.world_size
 
     def forward(self, x):
         attn_out = self.attn(self.ln_1(x))
 
         if self.drop_attn_sync:
             # SPD path: 1 sync per layer (inside MLP)
-            # 1) local pre-MLP input = LN2(X + attn_out_i) for each TP rank i
-            mlp_in_parts = [self.ln_2(x + y_i) for y_i in attn_out]
-            # 2) MLP does single row-parallel all-reduce internally
-            y = self.mklp.forward_spd(mlp_in_parts)
-            return x + y
+            x2 = self.ln_2(x)
+            C = x2.size(-1)
+            chunk = C // self.world_size
+
+            mlp_in_full = []
+            for i, y_i in enumerate(attn_out):
+                z = torch.zeros_like(x2)
+                z[..., i*chunk:(i+1)*chunk] = y_i   # place local attn output in slice i
+                mlp_in_full.append(x2 + z)          # full-width per-rank input
+
+            # MLP does single row-parallel all-reduce internally
+            y = self.mlp.forward_spd(mlp_in_full)     
+            # Add residual after reduce
+            return x + y 
+
         # Standard path: 2 syncs per layer
         x = x + attn_out
         return x + self.mlp(self.ln_2(x))
