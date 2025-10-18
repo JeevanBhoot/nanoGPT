@@ -1,4 +1,23 @@
 
+# Simulating Tensor Parallelism
+
+## Install
+
+Install uv:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Download dependencies:
+
+```bash
+uv sync
+```
+
+Prefix all Python commands with `uv run` so that they get the dependencies 
+e.g. `uv run data/openwebtext/prepare.py` to download and prepare OpenWebText.
+
 # nanoGPT
 
 ![nanoGPT](assets/nanogpt.jpg)
