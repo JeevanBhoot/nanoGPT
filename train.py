@@ -93,6 +93,14 @@ def _instantiate_model(model_impl_value, model_args):
     dense_args = {k: v for k, v in model_args.items() if k != 'world_size'}
     return GPT(GPTConfig(**dense_args))
 
+def _existing_checkpoint_path(directory):
+    if not os.path.isdir(directory):
+        return None
+    for root, _, files in os.walk(directory):
+        if 'ckpt.pt' in files:
+            return os.path.join(root, 'ckpt.pt')
+    return None
+
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -118,6 +126,9 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+existing_checkpoint = _existing_checkpoint_path(out_dir)
+if existing_checkpoint and init_from != 'resume':
+    raise RuntimeError(f"Found existing checkpoint at {existing_checkpoint}. Refusing to overwrite out_dir='{out_dir}'.")
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
