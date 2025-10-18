@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -54,6 +55,8 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+model_impl = 'dense' # 'dense' uses model.GPT, 'tensor_parallel' uses tensor_parallel_model.TensorParallelGPT
+tp_world_size = 2 # only used when model_impl == 'tensor_parallel'
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -77,6 +80,18 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+if model_impl not in {'dense', 'tensor_parallel'}:
+    raise ValueError(f"Unsupported model_impl '{model_impl}', choose 'dense' or 'tensor_parallel'")
+if tp_world_size < 1:
+    raise ValueError("tp_world_size must be >= 1")
+
+def _instantiate_model(model_impl_value, model_args):
+    """Create a GPT instance based on the requested implementation."""
+    if model_impl_value == 'tensor_parallel':
+        return TensorParallelGPT(TensorParallelGPTConfig(**model_args))
+    dense_args = {k: v for k, v in model_args.items() if k != 'world_size'}
+    return GPT(GPTConfig(**dense_args))
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -153,21 +168,32 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    if model_impl == 'tensor_parallel':
+        model_args['world_size'] = tp_world_size
+    else:
+        model_args.pop('world_size', None)
+    model = _instantiate_model(model_impl, model_args)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
+    checkpoint_model_impl = checkpoint.get('model_impl', 'dense')
+    if model_impl != checkpoint_model_impl:
+        print(f"Overriding model_impl to '{checkpoint_model_impl}' from checkpoint")
+        model_impl = checkpoint_model_impl
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    if model_impl == 'tensor_parallel':
+        tp_world_size = checkpoint_model_args.get('world_size', tp_world_size)
+        model_args['world_size'] = tp_world_size
+    else:
+        model_args.pop('world_size', None)
     # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = _instantiate_model(model_impl, model_args)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -182,15 +208,26 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    if model_impl == 'tensor_parallel':
+        model = TensorParallelGPT.from_pretrained(init_from, override_args)
+    else:
+        model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+    if model_impl == 'tensor_parallel':
+        tp_world_size = getattr(model.config, 'world_size', tp_world_size)
+        model_args['world_size'] = tp_world_size
+    else:
+        model_args.pop('world_size', None)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+config['model_impl'] = model_impl
+config['tp_world_size'] = tp_world_size
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -278,6 +315,8 @@ while True:
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
+                    'model_impl': model_impl,
+                    'tp_world_size': tp_world_size,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
