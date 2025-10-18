@@ -272,7 +272,7 @@ class TensorParallelGPT(nn.Module):
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if 'c_proj.weight' in pn:
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
@@ -477,14 +477,31 @@ def load_dense_into_tp(tp_model: TensorParallelGPT, dense_sd: dict):
             # dense shape: (3*C, C)
             W_qkv = dense_sd[f'transformer.h.{L}.attn.c_attn.weight']      # (3C, C)
             b_qkv = dense_sd.get(f'transformer.h.{L}.attn.c_attn.bias', None)  # (3C,)
-            W_qkv_chunks = torch.chunk(W_qkv, tp_model.tp.world_size, dim=0)
-            if b_qkv is not None:
-                b_qkv_chunks = torch.chunk(b_qkv, tp_model.tp.world_size, dim=0)
+            C = W_qkv.size(1)
+            world_size = tp_model.tp.world_size
+            local_n_head = block.attn.local_n_head
+            head_dim = block.attn.head_dim
 
-            for i in range(tp_model.tp.world_size):
-                block.attn.c_attn.weight[i].copy_(W_qkv_chunks[i])   # (3C/2, C)
+            W_q, W_k, W_v = torch.chunk(W_qkv, 3, dim=0)
+            if b_qkv is not None:
+                b_q, b_k, b_v = torch.chunk(b_qkv, 3, dim=0)
+
+            for rank in range(world_size):
+                start = rank * local_n_head * head_dim
+                end = start + local_n_head * head_dim
+
+                W_q_part = W_q[start:end]
+                W_k_part = W_k[start:end]
+                W_v_part = W_v[start:end]
+                tp_weight = torch.cat([W_q_part, W_k_part, W_v_part], dim=0)
+                block.attn.c_attn.weight[rank].copy_(tp_weight)
+
                 if block.attn.c_attn.bias is not None:
-                    block.attn.c_attn.bias[i].copy_(b_qkv_chunks[i]) # (3C/2,)
+                    b_q_part = b_q[start:end]
+                    b_k_part = b_k[start:end]
+                    b_v_part = b_v[start:end]
+                    tp_bias = torch.cat([b_q_part, b_k_part, b_v_part], dim=0)
+                    block.attn.c_attn.bias[rank].copy_(tp_bias)
 
             # --- Attention out proj (row-parallel) ---
             # dense shape: (C, C) ; split along input dim=1
