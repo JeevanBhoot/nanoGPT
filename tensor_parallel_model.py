@@ -467,6 +467,7 @@ def load_dense_into_tp(tp_model: TensorParallelGPT, dense_sd: dict):
     """Populate a TP-sim model from a dense (model.py) state_dict."""
     with torch.no_grad():
         # Embeddings and final head (kept dense)
+        # breakpoint()
         tp_model.transformer.wte.weight.copy_(dense_sd['transformer.wte.weight'])
         tp_model.transformer.wpe.weight.copy_(dense_sd['transformer.wpe.weight'])
         tp_model.lm_head.weight.copy_(dense_sd['lm_head.weight'])
