@@ -461,3 +461,70 @@ class TensorParallelGPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+
+
+def load_dense_into_tp(tp_model: TensorParallelGPT, dense_sd: dict):
+    """Populate a TP-sim model from a dense (model.py) state_dict."""
+    with torch.no_grad():
+        # Embeddings and final head (kept dense)
+        tp_model.transformer.wte.weight.copy_(dense_sd['transformer.wte.weight'])
+        tp_model.transformer.wpe.weight.copy_(dense_sd['transformer.wpe.weight'])
+        tp_model.lm_head.weight.copy_(dense_sd['lm_head.weight'])
+
+        for L, block in enumerate(tp_model.transformer.h):
+            # --- Attention QKV (column-parallel) ---
+            # dense shape: (3*C, C)
+            W_qkv = dense_sd[f'transformer.h.{L}.attn.c_attn.weight']      # (3C, C)
+            b_qkv = dense_sd.get(f'transformer.h.{L}.attn.c_attn.bias', None)  # (3C,)
+            W_qkv_chunks = torch.chunk(W_qkv, tp_model.tp.world_size, dim=0)
+            if b_qkv is not None:
+                b_qkv_chunks = torch.chunk(b_qkv, tp_model.tp.world_size, dim=0)
+
+            for i in range(tp_model.tp.world_size):
+                block.attn.c_attn.weight[i].copy_(W_qkv_chunks[i])   # (3C/2, C)
+                if block.attn.c_attn.bias is not None:
+                    block.attn.c_attn.bias[i].copy_(b_qkv_chunks[i]) # (3C/2,)
+
+            # --- Attention out proj (row-parallel) ---
+            # dense shape: (C, C) ; split along input dim=1
+            W_o = dense_sd[f'transformer.h.{L}.attn.c_proj.weight']        # (C, C)
+            b_o = dense_sd.get(f'transformer.h.{L}.attn.c_proj.bias', None)
+            W_o_chunks = torch.chunk(W_o, tp_model.tp.world_size, dim=1)
+            for i in range(tp_model.tp.world_size):
+                block.attn.c_proj.weight[i].copy_(W_o_chunks[i])     # (C, C/2)
+            if b_o is not None and block.attn.c_proj.bias is not None:
+                block.attn.c_proj.bias.copy_(b_o)
+
+            # --- MLP c_fc (column-parallel) ---
+            # dense shape: (4C, C) ; split dim=0
+            W_fc = dense_sd[f'transformer.h.{L}.mlp.c_fc.weight']          # (4C, C)
+            b_fc = dense_sd.get(f'transformer.h.{L}.mlp.c_fc.bias', None)  # (4C,)
+            W_fc_chunks = torch.chunk(W_fc, tp_model.tp.world_size, dim=0)
+            if b_fc is not None:
+                b_fc_chunks = torch.chunk(b_fc, tp_model.tp.world_size, dim=0)
+            for i in range(tp_model.tp.world_size):
+                block.mlp.c_fc.weight[i].copy_(W_fc_chunks[i])        # (2C, C)
+                if block.mlp.c_fc.bias is not None:
+                    block.mlp.c_fc.bias[i].copy_(b_fc_chunks[i])
+
+            # --- MLP c_proj (row-parallel) ---
+            # dense shape: (C, 4C) ; split input dim=1
+            W_fp = dense_sd[f'transformer.h.{L}.mlp.c_proj.weight']        # (C, 4C)
+            b_fp = dense_sd.get(f'transformer.h.{L}.mlp.c_proj.bias', None)
+            W_fp_chunks = torch.chunk(W_fp, tp_model.tp.world_size, dim=1)
+            for i in range(tp_model.tp.world_size):
+                block.mlp.c_proj.weight[i].copy_(W_fp_chunks[i])      # (C, 2C)
+            if b_fp is not None and block.mlp.c_proj.bias is not None:
+                block.mlp.c_proj.bias.copy_(b_fp)
+
+            # --- LayerNorms (unchanged) ---
+            for name in ('ln_1', 'ln_2'):
+                tp_ln = getattr(block, name)
+                tp_ln.weight.copy_(dense_sd[f'transformer.h.{L}.{name}.weight'])
+                if tp_ln.bias is not None:
+                    tp_ln.bias.copy_(dense_sd[f'transformer.h.{L}.{name}.bias'])
+
+        # final LN
+        tp_model.transformer.ln_f.weight.copy_(dense_sd['transformer.ln_f.weight'])
+        if tp_model.transformer.ln_f.bias is not None:
+            tp_model.transformer.ln_f.bias.copy_(dense_sd['transformer.ln_f.bias'])
