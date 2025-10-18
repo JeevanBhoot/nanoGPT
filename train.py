@@ -31,6 +31,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT
+from tensor_parallel_spd_model import TensorParallelSPDGPTConfig, TensorParallelSPDGPT
 
 
 def _str2bool(value):
@@ -68,7 +69,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n_embd", type=int, default=768, help="Embedding dimension.")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout ratio.")
     parser.add_argument("--bias", type=_str2bool, default=False, help="Use bias in LayerNorm/Linear layers.")
-    parser.add_argument("--model_impl", choices=["dense", "tensor_parallel"], default="dense", help="Model implementation to use.")
+    parser.add_argument("--model_impl", choices=["dense", "tensor_parallel", "tensor_parallel_spd"], default="dense", help="Model implementation to use.")
     parser.add_argument("--tp_world_size", type=int, default=2, help="Tensor-parallel world size (simulated).")
     # optimizer
     parser.add_argument("--learning_rate", type=float, default=6e-4, help="Base learning rate.")
@@ -162,8 +163,6 @@ device = args.device
 dtype = args.dtype or _DEFAULT_DTYPE
 compile = args.compile
 
-if model_impl not in {'dense', 'tensor_parallel'}:
-    raise ValueError(f"Unsupported model_impl '{model_impl}', choose 'dense' or 'tensor_parallel'")
 if tp_world_size < 1:
     raise ValueError("tp_world_size must be >= 1")
 
@@ -177,6 +176,8 @@ def _instantiate_model(model_impl_value, model_args):
     """Create a GPT instance based on the requested implementation."""
     if model_impl_value == 'tensor_parallel':
         return TensorParallelGPT(TensorParallelGPTConfig(**model_args))
+    elif model_impl_value == 'tensor_parallel_spd':
+        return TensorParallelSPDGPT(TensorParallelSPDGPTConfig(**model_args))
     dense_args = {k: v for k, v in model_args.items() if k != 'world_size'}
     return GPT(GPTConfig(**dense_args))
 
@@ -267,7 +268,7 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    if model_impl == 'tensor_parallel':
+    if model_impl == 'tensor_parallel' or model_impl == 'tensor_parallel_spd':
         model_args['world_size'] = tp_world_size
     else:
         model_args.pop('world_size', None)
@@ -288,7 +289,7 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    if model_impl == 'tensor_parallel':
+    if model_impl == 'tensor_parallel' or model_impl == 'tensor_parallel_spd':
         tp_world_size = checkpoint_model_args.get('world_size', tp_world_size)
         model_args['world_size'] = tp_world_size
     else:
@@ -311,12 +312,14 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     if model_impl == 'tensor_parallel':
         model = TensorParallelGPT.from_pretrained(init_from, override_args)
+    elif model_impl == 'tensor_parallel_spd':
+        model = TensorParallelSPDGPT.from_pretrained(init_from, override_args)
     else:
         model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-    if model_impl == 'tensor_parallel':
+    if model_impl == 'tensor_parallel' or model_impl == 'tensor_parallel_spd':
         tp_world_size = getattr(model.config, 'world_size', tp_world_size)
         model_args['world_size'] = tp_world_size
     else:
