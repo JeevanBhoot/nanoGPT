@@ -55,26 +55,25 @@ class ColumnParallelLinear(nn.Module):
         self.out_features = out_features
         self.world_size = tp.world_size
 
+        out_size = out_features // self.world_size
+
         self.weight = nn.ParameterList([
-            nn.Parameter(torch.empty(in_features, out_features // self.world_size)) for _ in range(self.world_size)
+            nn.Parameter(torch.empty(out_size, in_features)) for _ in range(self.world_size)
         ])
         self.bias = nn.ParameterList([
-            nn.Parameter(torch.zeros(out_features // self.world_size)) for _ in range(self.world_size)
+            nn.Parameter(torch.zeros(out_size)) for _ in range(self.world_size)
         ]) if bias else None
         self.reset_parameters()
     
     def reset_parameters(self):
         for w in self.weight:
-            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            nn.init.normal_(w, mean=0.0, std=0.02)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias = [None]*self.world_size
-        if self.bias is not None:
-            bias = [b for b in self.bias]
-        outputs = [
-            F.linear(x, w, b) for w, b in zip(self.weight, bias, strict=True)
-        ]
-        return outputs
+        if self.bias:
+            return [F.linear(x, w, b) for w, b in zip(self.weight, self.bias, strict=True)]
+        else:
+            return [F.linear(x, w, None) for w in self.weight]
 
 
 class RowParallelLinear(nn.Module):
@@ -98,15 +97,17 @@ class RowParallelLinear(nn.Module):
         self.tp = tp
         self.world_size = tp.world_size
 
+        in_size = in_features // self.world_size
+
         self.weight = nn.ParameterList([
-            nn.Parameter(torch.empty(in_features // self.world_size, out_features)) for _ in range(self.world_size)
+            nn.Parameter(torch.empty(out_features, in_size)) for _ in range(self.world_size)
         ])
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self.reset_parameters()
     
     def reset_parameters(self):
         for w in self.weight:
-            nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            nn.init.normal_(w, mean=0.0, std=0.02)
     
     def forward(self, x_parts: List[torch.Tensor]) -> torch.Tensor:
         assert len(x_parts) == self.world_size, (
@@ -222,12 +223,12 @@ class TensorParallelMLP(nn.Module):
 
     def forward(self, x):
         # Column-parallel feedforward
-        x = self.c_fc(x)
-        x = self.gelu(x)
+        parts = self.c_fc(x)
+        parts = [self.gelu(p) for p in parts]
         # Row-parallel projection with all-reduce
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        y = self.c_proj(parts)
+        y = self.dropout(y)
+        return y
 
 
 class TensorParallelBlock(nn.Module):
