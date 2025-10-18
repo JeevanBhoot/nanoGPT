@@ -16,10 +16,12 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+import argparse
 import os
 import time
 import math
 import pickle
+import runpy
 from contextlib import nullcontext
 
 import numpy as np
@@ -30,61 +32,146 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT
 
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
-# data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
-# model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-model_impl = 'dense' # 'dense' uses model.GPT, 'tensor_parallel' uses tensor_parallel_model.TensorParallelGPT
-tp_world_size = 2 # only used when model_impl == 'tensor_parallel'
-# adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
+
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"yes", "true", "t", "1"}:
+        return True
+    if value in {"no", "false", "f", "0"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got '{value}'")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train a GPT model on OpenWebText.")
+    # I/O and logging
+    parser.add_argument("--out_dir", default="out", help="Output directory for checkpoints.")
+    parser.add_argument("--eval_interval", type=int, default=2000, help="How often to evaluate the model.")
+    parser.add_argument("--log_interval", type=int, default=1, help="How often to log training progress.")
+    parser.add_argument("--eval_iters", type=int, default=200, help="Iterations per evaluation.")
+    parser.add_argument("--eval_only", type=_str2bool, default=False, help="Run evaluation only and exit.")
+    parser.add_argument("--always_save_checkpoint", type=_str2bool, default=True, help="Always save checkpoints on eval.")
+    parser.add_argument("--init_from", default="scratch", help="Initialization method: 'scratch', 'resume', or 'gpt2*'.")
+    parser.add_argument("--wandb_log", type=_str2bool, default=False, help="Enable W&B logging.")
+    parser.add_argument("--wandb_project", default="owt", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_run_name", default="gpt2", help="Weights & Biases run name.")
+    # data
+    parser.add_argument("--dataset", default="openwebtext", help="Dataset name.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=5 * 8, help="Steps to accumulate gradients.")
+    parser.add_argument("--batch_size", type=int, default=12, help="Micro-batch size.")
+    parser.add_argument("--block_size", type=int, default=1024, help="Sequence length.")
+    # model
+    parser.add_argument("--n_layer", type=int, default=12, help="Number of transformer layers.")
+    parser.add_argument("--n_head", type=int, default=12, help="Number of attention heads.")
+    parser.add_argument("--n_embd", type=int, default=768, help="Embedding dimension.")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout ratio.")
+    parser.add_argument("--bias", type=_str2bool, default=False, help="Use bias in LayerNorm/Linear layers.")
+    parser.add_argument("--model_impl", choices=["dense", "tensor_parallel"], default="dense", help="Model implementation to use.")
+    parser.add_argument("--tp_world_size", type=int, default=2, help="Tensor-parallel world size (simulated).")
+    # optimizer
+    parser.add_argument("--learning_rate", type=float, default=6e-4, help="Base learning rate.")
+    parser.add_argument("--max_iters", type=int, default=600000, help="Maximum training iterations.")
+    parser.add_argument("--weight_decay", type=float, default=1e-1, help="Weight decay.")
+    parser.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1.")
+    parser.add_argument("--beta2", type=float, default=0.95, help="AdamW beta2.")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value (0 to disable).")
+    # LR schedule
+    parser.add_argument("--decay_lr", type=_str2bool, default=True, help="Apply learning-rate decay.")
+    parser.add_argument("--warmup_iters", type=int, default=2000, help="Warmup iterations.")
+    parser.add_argument("--lr_decay_iters", type=int, default=600000, help="Cosine decay iterations.")
+    parser.add_argument("--min_lr", type=float, default=6e-5, help="Minimum learning rate.")
+    # system
+    parser.add_argument("--backend", default="nccl", help="DDP backend.")
+    parser.add_argument("--device", default="cuda", help="Device identifier (e.g., 'cuda', 'cuda:0', 'cpu').")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "bfloat16", "float16"],
+        default=None,
+        help="Computation dtype. Defaults to bf16 if available else fp16.",
+    )
+    parser.add_argument("--compile", type=_str2bool, default=True, help="Use torch.compile for speed.")
+    return parser
+
+
+config_parser = argparse.ArgumentParser(add_help=False)
+config_parser.add_argument("--config", action="append", default=[], help="Path(s) to config .py files.")
+config_parser.add_argument("config_files", nargs="*", help="Legacy positional config files.")
+config_args, remaining_argv = config_parser.parse_known_args()
+
+_DEFAULT_DTYPE = (
+    "bfloat16"
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    else "float16"
+)
+
+parser = build_arg_parser()
+
+config_paths = list(config_args.config_files)
+config_paths.extend(config_args.config)
+
+if config_paths:
+    # We'll execute configs in order, later entries override earlier ones.
+    dest_names = {action.dest for action in parser._actions if action.dest != argparse.SUPPRESS}
+    config_defaults = {}
+    for path in config_paths:
+        print(f"Loading config from {path}")
+        overrides = runpy.run_path(path)
+        for key, value in overrides.items():
+            if key in dest_names:
+                config_defaults[key] = value
+    if config_defaults:
+        parser.set_defaults(**config_defaults)
+
+args = parser.parse_args(remaining_argv)
+
+out_dir = args.out_dir
+eval_interval = args.eval_interval
+log_interval = args.log_interval
+eval_iters = args.eval_iters
+eval_only = args.eval_only
+always_save_checkpoint = args.always_save_checkpoint
+init_from = args.init_from
+wandb_log = args.wandb_log
+wandb_project = args.wandb_project
+wandb_run_name = args.wandb_run_name
+dataset = args.dataset
+gradient_accumulation_steps = args.gradient_accumulation_steps
+batch_size = args.batch_size
+block_size = args.block_size
+n_layer = args.n_layer
+n_head = args.n_head
+n_embd = args.n_embd
+dropout = args.dropout
+bias = args.bias
+model_impl = args.model_impl
+tp_world_size = args.tp_world_size
+learning_rate = args.learning_rate
+max_iters = args.max_iters
+weight_decay = args.weight_decay
+beta1 = args.beta1
+beta2 = args.beta2
+grad_clip = args.grad_clip
+decay_lr = args.decay_lr
+warmup_iters = args.warmup_iters
+lr_decay_iters = args.lr_decay_iters
+min_lr = args.min_lr
+backend = args.backend
+device = args.device
+dtype = args.dtype or _DEFAULT_DTYPE
+compile = args.compile
 
 if model_impl not in {'dense', 'tensor_parallel'}:
     raise ValueError(f"Unsupported model_impl '{model_impl}', choose 'dense' or 'tensor_parallel'")
 if tp_world_size < 1:
     raise ValueError("tp_world_size must be >= 1")
+
+config = vars(args).copy()
+config['dtype'] = dtype
+config['compile'] = compile
+config['config_files'] = config_paths.copy()
+
 
 def _instantiate_model(model_impl_value, model_args):
     """Create a GPT instance based on the requested implementation."""
@@ -92,6 +179,7 @@ def _instantiate_model(model_impl_value, model_args):
         return TensorParallelGPT(TensorParallelGPTConfig(**model_args))
     dense_args = {k: v for k, v in model_args.items() if k != 'world_size'}
     return GPT(GPTConfig(**dense_args))
+
 
 def _existing_checkpoint_path(directory):
     if not os.path.isdir(directory):
@@ -188,6 +276,8 @@ elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    if ckpt_path is None:
+        raise FileNotFoundError(f"No checkpoint found in {out_dir} to resume from.")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     checkpoint_model_impl = checkpoint.get('model_impl', 'dense')
