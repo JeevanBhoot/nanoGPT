@@ -111,17 +111,23 @@ class RowParallelLinear(nn.Module):
         for w in self.weight:
             nn.init.normal_(w, mean=0.0, std=0.02)
     
-    def forward(self, x_parts: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, 
+                x_parts: List[torch.Tensor],
+                skip_reduce: bool = False,
+        ) -> torch.Tensor:
         assert len(x_parts) == self.world_size, (
             f"Expected {self.world_size} inputs, got {len(x_parts)}"
         )
         outputs = [
             F.linear(x_part, w) for x_part, w in zip(x_parts, self.weight, strict=True)
         ]
-        output = self.tp.all_reduce_sum(outputs)
-        if self.bias is not None:
-            output += self.bias
-        return output
+        if skip_reduce:
+            return outputs
+        else:
+            output = self.tp.all_reduce_sum(outputs)
+            if self.bias is not None:
+                output += self.bias
+            return output
       
 
 class LayerNorm(nn.Module):
@@ -165,16 +171,14 @@ class TensorParallelCausalSelfAttention(nn.Module):
             bias=self.bias,
             tp=tp,
         )
-        # output projection; row-parallel with all-reduce (1 sync)
+        # output projection; row-parallel with optional all-reduce (1 sync)
+        # if drop_attn_sync is True, all-reduce is skipped in forward()
         self.c_proj = RowParallelLinear(
             config.n_embd,
             config.n_embd,
             bias=cproj_bias,
             tp=tp,
         )
-        if self.drop_attn_sync:
-            for p in self.c_proj.parameters():
-                p.requires_grad = False
         # regularization
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
@@ -212,14 +216,15 @@ class TensorParallelCausalSelfAttention(nn.Module):
                 y = att @ v
             
             y = y.transpose(1, 2).contiguous().view(B, T, self.local_n_head * self.head_dim)
-            if self.drop_attn_sync:
-                y = self.resid_dropout(y)
             attn_outputs.append(y)
 
+        # Row-parallel output projection
         if self.drop_attn_sync:
-            return attn_outputs
-
-        # Row-parallel output projection with all-reduce (1 sync)
+            # SPD path: skip all-reduce
+            y = self.c_proj(attn_outputs, self.drop_attn_sync)
+            y = [self.resid_dropout(yi) for yi in y]
+            return y
+        # Standard path: do all-reduce
         y = self.c_proj(attn_outputs)
         y = self.resid_dropout(y)
         return y
@@ -242,7 +247,11 @@ class TensorParallelMLP(nn.Module):
         return self.dropout(y)
     
     def forward_spd(self, x_parts: List[torch.Tensor]) -> torch.Tensor:
-        # like forward(), but input is already partitioned per TP rank
+        """
+        SPD Forward for MLP.
+        
+        Like forward(), but input is already partitioned per TP rank.
+        """
         # 1) Column-parallel matmul (from parts)
         parts = [F.linear(xp, w, (b if self.c_fc.bias else None))
                 for xp, w, b in zip(x_parts, self.c_fc.weight,
@@ -269,18 +278,10 @@ class TensorParallelBlock(nn.Module):
         if self.drop_attn_sync:
             # SPD path: 1 sync per layer (inside MLP)
             x2 = self.ln_2(x)
-            C = x2.size(-1)
-            chunk = C // self.world_size
-
-            mlp_in_full = []
-            for i, y_i in enumerate(attn_out):
-                z = torch.zeros_like(x2)
-                z[..., i*chunk:(i+1)*chunk] = y_i   # place local attn output in slice i
-                mlp_in_full.append(x2 + z)          # full-width per-rank input
-
-            # MLP does single row-parallel all-reduce internally
-            y = self.mlp.forward_spd(mlp_in_full)     
-            # Add residual after reduce
+            # Create input parts for MLP
+            mlp_in_parts = [x2 + yi for yi in attn_out]
+            y = self.mlp.forward_spd(mlp_in_parts)
+            # Add residual after all-reduce.
             return x + y 
 
         # Standard path: 2 syncs per layer
