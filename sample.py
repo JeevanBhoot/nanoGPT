@@ -11,6 +11,7 @@ import tiktoken
 
 from model import GPTConfig, GPT
 from tensor_parallel_model import TensorParallelGPTConfig, TensorParallelGPT, load_dense_into_tp
+from tensor_parallel_spd_model import TensorParallelSPDGPTConfig, TensorParallelSPDGPT
 
 
 _DEFAULT_DTYPE = (
@@ -40,7 +41,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=10,
+        default=2,
         help="Number of completions to generate.",
     )
     parser.add_argument(
@@ -84,9 +85,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable torch.compile for the loaded model.",
     )
     parser.add_argument(
+        "--model_impl",
+        choices=["dense", "tp", "tp_spd"],
+        default="dense",
+        help="Model implementation to use.",
+    )
+    parser.add_argument(
         "--tp",
         type=int,
-        default=1,
+        default=2,
         help="Tensor-parallel world size to simulate.",
     )
     return parser
@@ -120,14 +127,21 @@ def main() -> None:
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
 
-        if args.tp > 1:
+        if args.model_impl == "dense":
+            gptconf = GPTConfig(**checkpoint["model_args"])
+            model = GPT(gptconf)
+            model.load_state_dict(state_dict)
+        elif args.model_impl == "tp":
+            assert args.tp > 1, "tp world size must be > 1 for tensor-parallel model"
             gptconf = TensorParallelGPTConfig(**checkpoint["model_args"])
             gptconf.world_size = args.tp
             model = TensorParallelGPT(gptconf)
             load_dense_into_tp(model, state_dict)
         else:
-            gptconf = GPTConfig(**checkpoint["model_args"])
-            model = GPT(gptconf)
+            assert args.tp > 1, "tp world size must be > 1 for tensor-parallel model"
+            gptconf = TensorParallelSPDGPTConfig(**checkpoint["model_args"])
+            gptconf.world_size = args.tp
+            model = TensorParallelSPDGPT(gptconf)
             model.load_state_dict(state_dict)
     elif args.init_from.startswith("gpt2"):
         model = GPT.from_pretrained(args.init_from, dict(dropout=0.0))
