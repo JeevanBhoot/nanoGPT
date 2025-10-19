@@ -1,5 +1,6 @@
 """
-Simulated Megatron-LM style tensor-parallel (TP=2) GPT for nanoGPT.
+Simulated Megatron-LM style tensor-parallel (TP=2) GPT for nanoGPT,
+with Sync-Point Drop (SPD) to remove attention all-reduce and reduce MLP all-reduce frequency.
 """
 
 import math
