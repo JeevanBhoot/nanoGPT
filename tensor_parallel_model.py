@@ -34,6 +34,9 @@ class TensorParallel:
             )
         self.all_reduce_count += 1
         return sum(tensors)
+    
+    def reset_all_reduce_count(self):
+        self.all_reduce_count = 0
 
 
 class ColumnParallelLinear(nn.Module):
