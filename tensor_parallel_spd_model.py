@@ -4,6 +4,7 @@ Simulated Megatron-LM style tensor-parallel (TP=2) GPT for nanoGPT.
 
 import math
 import inspect
+import numpy as np
 from dataclasses import dataclass
 from typing import List
 
@@ -23,6 +24,8 @@ class TensorParallelSPDGPTConfig:
     world_size: int = 2 # TP world size
     drop_attn_sync: bool = True # drop the all-reduce after attention (SPD)
     attn_cproj_bias: bool = False # makes SPD simpler
+    mlp_sync_every: int | None = None # if set, do all-reduce in MLP every N layers (SPD)
+    mlp_skip_sync_mask: List[int] | None = None # if set, skip all-reduce in MLP at these layer indices (SPD)
 
 
 class TensorParallel:
@@ -260,10 +263,26 @@ class TensorParallelMLP(nn.Module):
         # 2) Row-parallel projection with all-reduce
         output = self.c_proj(parts)
         return self.dropout(output)
+    
+    def forward_spd_no_reduce(self, x_parts: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        SPD Forward for MLP without all-reduce.
+
+        Like forward_spd(), but skips the all-reduce in c_proj, returning
+        the partial outputs per TP rank.
+        """
+        # 1) Column-parallel matmul (from parts)
+        parts = [F.linear(xp, w, (b if self.c_fc.bias else None))
+                for xp, w, b in zip(x_parts, self.c_fc.weight,
+                                    (self.c_fc.bias or [None]*len(self.c_fc.weight)), strict=True)]
+        parts = [self.gelu(p) for p in parts]
+        # 2) Row-parallel projection without all-reduce
+        outputs = self.c_proj(parts, skip_reduce=True)
+        return [self.dropout(o) for o in outputs]
 
 
 class TensorParallelBlock(nn.Module):
-    def __init__(self, config: TensorParallelSPDGPTConfig, tp: TensorParallel):
+    def __init__(self, config: TensorParallelSPDGPTConfig, tp: TensorParallel, layer_idx: int):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = TensorParallelCausalSelfAttention(config, tp)
@@ -271,6 +290,25 @@ class TensorParallelBlock(nn.Module):
         self.mlp = TensorParallelMLP(config, tp)
         self.drop_attn_sync = getattr(config, "drop_attn_sync", False)
         self.world_size = tp.world_size
+        self.layer_idx = layer_idx
+        self.config = config
+        self.mask = None
+        mask = getattr(self.config, "mlp_skip_sync_mask", None)
+        if mask:
+            n = config.n_layer
+            self.mask = np.ones(n, dtype=bool)
+            self.mask[mask] = False
+
+    def _mlp_should_reduce(self) -> bool:
+        if self.drop_attn_sync is False:
+            # not SPD; always reduce
+            return True
+        if self.mask is not None:
+            return bool(self.mask[self.layer_idx])
+        k = getattr(self.config, "mlp_sync_every", None)
+        if k is not None and k > 0:
+            return (self.layer_idx % k) == (k - 1)
+        return True
 
     def forward(self, x):
         attn_out = self.attn(self.ln_1(x))
@@ -280,9 +318,23 @@ class TensorParallelBlock(nn.Module):
             x2 = self.ln_2(x)
             # Create input parts for MLP
             mlp_in_parts = [x2 + yi for yi in attn_out]
-            y = self.mlp.forward_spd(mlp_in_parts)
-            # Add residual after all-reduce.
-            return x + y 
+
+            if self._mlp_should_reduce():
+                # Do all-reduce in MLP
+                y = self.mlp.forward_spd(mlp_in_parts)
+                # Add residual after all-reduce.
+                return x + y
+            
+            y_parts_full = self.mlp.forward_spd_no_reduce(mlp_in_parts)
+            # Assemble a full-width tensor WITHOUT cross-rank communication:
+            # keep only each part's "own" contiguous channel slice and discard cross-slice mixing.
+            # (Architectural change: approximates a block-diagonal readout this layer.)
+            C = x.size(-1)
+            chunk = C // self.world_size
+            y_assembled = torch.zeros_like(x)
+            for i, yi in enumerate(y_parts_full):
+                y_assembled[..., i*chunk:(i+1)*chunk] = yi[..., i*chunk:(i+1)*chunk]
+            return x + y_assembled
 
         # Standard path: 2 syncs per layer
         x = x + attn_out
@@ -302,7 +354,7 @@ class TensorParallelSPDGPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([TensorParallelBlock(config, self.tp) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([TensorParallelBlock(config, self.tp, i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
